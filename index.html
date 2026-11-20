@@ -1,0 +1,270 @@
+<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#11396a"><title>INVENTORY SYSTEM</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f1f5fa;color:#162e49;font:16px/1.5 Inter,system-ui,sans-serif}header{background:#11396a;color:white;padding:34px max(20px,calc((100% - 620px)/2)) 46px}h1{margin:0;font-size:clamp(30px,6vw,44px);letter-spacing:-.045em}header p{margin:4px 0;color:#d4e5f8}main{max-width:660px;margin:-24px auto 32px;padding:0 16px}.panel{background:white;border:1px solid #d7e1eb;border-radius:16px;padding:20px;margin-bottom:14px}label,h2{display:block;font-weight:700;margin:0 0 10px;font-size:18px}input{width:100%;font:inherit}input[type=file]{font-size:14px}input::file-selector-button{padding:10px 14px;border-radius:8px;background:#195aab;color:white;border:0;font:inherit;font-weight:650;margin-right:10px}input[type=search]{padding:12px;border:1px solid #91a9bf;border-radius:10px}input:focus-visible,button:focus-visible{outline:3px solid #64a4da}#status{margin:10px 0 0;color:#486079;font-size:14px}#matches button{display:flex;gap:12px;align-items:baseline;text-align:left;width:100%;border:0;border-bottom:1px solid #dce6ef;padding:12px 4px;background:white;color:#1b436c;font:inherit;cursor:pointer}#matches button:hover{background:#f2f7fc}#detail {margin-top:18px}
+#detail dl {display:grid;grid-template-columns:minmax(0,0.85fr) minmax(0,1.3fr);gap:10px;margin:0}
+#detail dl div {min-width:0;padding:16px;border-radius:12px;background:#eff5fc;border:1px solid #dae6f4}
+#detail dt {font-size:14px;color:#405b78}
+#detail dd {margin:6px 0 0;font-weight:700;font-size:clamp(19px,4vw,28px);line-height:1.25;color:#123f74;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+@media(max-width:420px){#detail dl{grid-template-columns:1fr}#detail dl div{display:flex;align-items:center;justify-content:space-between;gap:10px}#detail dd{margin:0}}
+#matches h2{margin:20px 0 8px;color:#193e68}#matches table{width:100%;border-collapse:collapse;font-size:clamp(12px,3.4vw,15px);font-variant-numeric:tabular-nums}#matches th,#matches td{text-align:right;padding:9px 4px;border-bottom:1px solid #dae4ef}#matches th{background:#edf4fc}#matches th:first-child,#matches td:first-child{text-align:left;overflow-wrap:anywhere}#matches td:last-child{white-space:nowrap}
+</style></head><body><header><h1>INVENTORY SYSTEM</h1></header><main>
+<section class="panel"><label for="file">Pilih file LZH</label><input id="file" type="file" accept=".lzh,.lha"><p id="status" role="status">File dibaca langsung di perangkat Anda.</p></section>
+<section class="panel"><label for="plu">Cari PLU atau planogram</label><input type="search" autocapitalize="characters" autocomplete="off" id="plu" placeholder="Contoh 244 atau VK1" disabled>
+<div id="detail" aria-live="polite" hidden><dl><div><dt>Stok</dt><dd id="stock"></dd></div><div><dt>HPP rata-rata / unit</dt><dd id="avg"></dd></div></dl></div><div id="matches"></div></section>
+</main><script type="text/plain" id="engine">
+// LHA level 2 extended headers and static Huffman blocks (-lh4- through -lh7-).
+function requireData(condition, message = 'Struktur arsip tidak valid atau file terpotong.') {
+  if (!condition) throw new Error(message);
+}
+const latin = new TextDecoder('windows-1252');
+function archiveEntry(bytes, extension, expectedName = '') {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let pos = 0, selected;
+  while (pos + 1 < bytes.length && view.getUint16(pos, true)) {
+    requireData(pos + 24 <= bytes.length);
+    const level = bytes[pos + 20];
+    requireData(level === 2, 'Versi header LZH belum didukung. Gunakan backup POS dengan header level 2.');
+    const header = view.getUint16(pos, true), packed = view.getUint32(pos + 7, true);
+    const start = pos + header, end = start + packed;
+    requireData(header >= 26 && end <= bytes.length);
+    let name = '';
+    for (let i = pos + 24; i + 2 <= start;) {
+      const size = view.getUint16(i, true);
+      if (!size) break;
+      requireData(size >= 3 && i + size <= start);
+      if (bytes[i + 2] === 1) name = latin.decode(bytes.subarray(i + 3, i + size));
+      i += size;
+    }
+    if (name.toUpperCase().endsWith(extension) && (!expectedName || name.toUpperCase() === expectedName)) {
+      requireData(!selected, 'Ada beberapa tabel .INV. Pilih backup satu toko dan satu tanggal.');
+      selected = {name, method:latin.decode(bytes.subarray(pos+2,pos+7)), size:view.getUint32(pos+11,true), crc:view.getUint16(pos+21,true), data:bytes.subarray(start,end)};
+    }
+    pos = end;
+  }
+  if (extension === '.INV') requireData(selected, 'File .INV tidak ditemukan di dalam arsip LZH.');
+  return selected;
+}
+function inflateLha(data, size, dictBits) {
+  const output = new Uint8Array(size);
+  let bit = 0;
+  function bits(count) {
+    requireData(bit + count <= data.length * 8);
+    let value = 0;
+    while (count--) {
+      value = value * 2 + ((data[bit >> 3] >> (7 - (bit & 7))) & 1);
+      bit++;
+    }
+    return value;
+  }
+  function tree(lengths) {
+    const counts = Array(17).fill(0), next = Array(17).fill(0), codes = new Map();
+    lengths.forEach(len => { if (len) counts[len]++; });
+    for (let len=1; len<=16; len++) next[len] = (next[len-1] + counts[len-1]) * 2;
+    requireData(next[16] + counts[16] === 65536);
+    lengths.forEach((len, sym) => { if (len) codes.set((1 << len) + next[len]++, sym); });
+    return () => {
+      let code = 1;
+      for (let i=0; i<16; i++) {
+        code = code*2 + bits(1);
+        if (codes.has(code)) return codes.get(code);
+      }
+      throw new Error('Kode kompresi LZH tidak valid.');
+    };
+  }
+  function shortTree(limit, width, skip) {
+    const n = bits(width);
+    if (!n) {const sym=bits(width); requireData(sym<limit); return () => sym;}
+    requireData(n<=limit);
+    const lengths=[];
+    while (lengths.length<n) {
+      let len=bits(3);
+      if (len===7) while (bits(1)) requireData(++len<=16);
+      lengths.push(len);
+      if (lengths.length===skip) lengths.push(...Array(bits(2)).fill(0));
+    }
+    requireData(lengths.length<=limit);
+    return tree(lengths);
+  }
+  function literalTree(pre) {
+    const n=bits(9);
+    if (!n) {const sym=bits(9);requireData(sym<510);return () => sym;}
+    requireData(n<=510);
+    const lengths=[];
+    while (lengths.length<n) {
+      const sym=pre();
+      if (sym>=3) lengths.push(sym-2);
+      else {
+        const zeros=sym===0 ? 1 : sym===1 ? bits(4)+3 : bits(9)+20;
+        requireData(lengths.length+zeros<=n);
+        lengths.push(...Array(zeros).fill(0));
+      }
+    }
+    return tree(lengths);
+  }
+  let written=0;
+  while (written<size) {
+    const symbols=bits(16);requireData(symbols>0);
+    const lit=literalTree(shortTree(19,5,3));
+    const dist=shortTree(dictBits+1, dictBits<=13 ? 4 : 5, -1);
+    for (let j=0;j<symbols;j++) {
+      requireData(written<size);
+      const sym=lit();
+      if (sym<256) output[written++]=sym;
+      else {
+        const p=dist(), offset=p===0 ? 1 : 1+(1<<(p-1))+bits(p-1);
+        const length=sym-253;
+        requireData(written+length<=size);
+        for (let k=0;k<length;k++) {
+          output[written]=written<offset ? 32 : output[written-offset];
+          written++;
+        }
+      }
+    }
+  }
+  return output;
+}
+function unpack(entry) {
+  const {size,method,data}=entry;
+  requireData(size>0 && size<=64*1024*1024,'Ukuran tabel inventori di luar batas 64 MB.');
+  const widths={'-lh4-':12,'-lh5-':13,'-lh6-':15,'-lh7-':16};
+  requireData(method==='-lh0-' || widths[method], 'Metode kompresi '+method+' belum didukung.');
+  const raw=method==='-lh0-' ? data : inflateLha(data,size,widths[method]);
+  requireData(raw.length===size);
+  let crc=0;
+  for (const byte of raw) {
+    crc^=byte;
+    for (let k=0;k<8;k++) crc=(crc&1) ? (crc>>>1)^0xa001 : crc>>>1;
+  }
+  requireData(crc===entry.crc,'Pemeriksaan integritas .INV gagal. Pilih ulang backup asli.');
+  return raw;
+}
+function* records(raw, required) {
+  const view=new DataView(raw.buffer,raw.byteOffset,raw.byteLength);
+  requireData(raw.length>=33);
+  const count=view.getUint32(4,true), header=view.getUint16(8,true), width=view.getUint16(10,true);
+  requireData(header>=33 && width>1 && header+count*width<=raw.length);
+  const fields=new Map();
+  let offset=1;
+  for (let j=32;j+32<=header && raw[j]!==13;j+=32) {
+    const name=latin.decode(raw.subarray(j,j+11)).split('\0')[0].trim();
+    const len=raw[j+16];fields.set(name,[offset,len]);offset+=len;
+  }
+  requireData(offset<=width && required.every(k=>fields.has(k)),'Kolom tabel tidak lengkap.');
+  for(let pos=header;pos<header+count*width;pos+=width) {
+    if(raw[pos]===42) continue;
+    function value(k) {
+      if (!fields.has(k)) return '';
+      const [start,len]=fields.get(k);
+      return latin.decode(raw.subarray(pos+start,pos+start+len)).trim();
+    }
+    yield value;
+  }
+}
+function readInventory(raw) {
+  const items=[], stores=new Set(), dates=new Set();
+  function number(value) {return /^-?\d+(\.\d+)?$/.test(value) ? Number(value) : null;}
+  for (const value of records(raw,['PLU_I','Q_STK_I','DESCP'])) {
+    const code=value('PLU_I');if(!code) continue;
+    stores.add(value('TOKO_I')); dates.add(value('TANGGAL'));
+    items.push({code,name:value('DESCP'),stock:number(value('Q_STK_I')),avg:number(value('AVG_COST_I'))});
+  }
+  requireData(items.length,'Tabel inventori kosong.');
+  requireData(stores.size===1 && dates.size===1,'Tabel inventori berisi lebih dari satu toko atau tanggal.');
+  return {items,store:[...stores][0],date:[...dates][0]};
+}
+self.onmessage = event => {
+  try {
+    const bytes = new Uint8Array(event.data);
+    const inv = archiveEntry(bytes, '.INV');
+    const data = readInventory(unpack(inv));
+    const so = archiveEntry(bytes, '.SO', inv.name.toUpperCase().slice(0,-4) + '.SO');
+    const groups = new Map();
+    if (so) {
+      for (const value of records(unpack(so), ['PLU','PLANOGRAM'])) {
+        const rack = value('PLANOGRAM').toUpperCase(), code = value('PLU');
+        if (!rack || !code || (value('STORE') && value('STORE') !== data.store)) continue;
+        if (!groups.has(rack)) groups.set(rack,new Map());
+        groups.get(rack).set(code,value('DESCP'));
+      }
+    }
+    self.postMessage({...data, groups});
+  }
+  catch(error) {self.postMessage({error:error.message});}
+};
+</script><script>
+const el = id => document.getElementById(id);
+const quantity = new Intl.NumberFormat('id-ID',{maximumFractionDigits:4});
+const rupiah = new Intl.NumberFormat('id-ID',{style:'currency',currency:'IDR',minimumFractionDigits:2,maximumFractionDigits:2});
+let groups=new Map(), items=[], exact=new Map(), worker=null, selection=0;
+const source=URL.createObjectURL(new Blob([el('engine').textContent],{type:'text/javascript'}));
+function show(item) {
+  el('detail').hidden=!item;
+  if(!item) return;
+  for(const field of ['stock','avg']){
+    const format=field==='stock'?quantity:rupiah;
+    el(field).textContent=item[field]===null?'Tidak tersedia':format.format(item[field]);
+  }
+}
+function search() {
+  const code=el('plu').value.trim().toUpperCase(),list=el('matches');
+  list.replaceChildren();show(exact.get(code));
+  if(groups.has(code)) {
+    const group=groups.get(code), heading=document.createElement('h2');
+    heading.textContent='Planogram '+code+' · '+group.size+' PLU';
+    list.append(heading);
+    const table=document.createElement('table');
+    const head=table.createTHead().insertRow();
+    for(const label of ['PLU / Barang','Stok','HPP / unit']) {
+      const th=document.createElement('th');
+      th.scope='col'; th.textContent=label; head.append(th);
+    }
+    const body=table.createTBody();
+    for(const [plu,name] of group) {
+      const item=exact.get(plu), row=body.insertRow(), cell=row.insertCell();
+      const id=document.createElement('strong');
+      id.textContent=plu;
+      cell.append(id,document.createElement('br'),document.createTextNode(name || item?.name || ''));
+      row.insertCell().textContent=item?.stock==null?'—':quantity.format(item.stock);
+      row.insertCell().textContent=item?.avg==null?'—':rupiah.format(item.avg);
+    }
+    list.append(table);
+    return;
+  }
+  if(!code || exact.has(code)) return;
+  const similar=items.filter(item=>item.code!==code && item.code.startsWith(code));
+  if(!similar.length && !exact.has(code)) list.textContent='PLU atau planogram '+code+' tidak ditemukan di file ini.';
+  for(const item of similar.slice(0,20)){
+    const button=document.createElement('button'),label=document.createElement('strong');
+    label.textContent=item.code;button.append(label,document.createTextNode(item.name));
+    button.onclick=()=>{el('plu').value=item.code;search();};
+    list.append(button);
+  }
+  if(similar.length>20) list.append(document.createTextNode('Menampilkan 20 hasil. Ketik PLU lebih lengkap.'));
+}
+el('plu').addEventListener('input',search);
+el('file').onchange=async function(){
+  const id=++selection;
+  if(worker) worker.terminate();
+  groups.clear();items=[];exact.clear();el('plu').value='';el('plu').disabled=true;search();
+  const file=this.files[0];
+  if(!file){el('status').textContent='Pilih backup toko.';return;}
+  el('status').textContent='Membaca inventori…';
+  try{
+    if(file.size>128*1024*1024) throw new Error('Ukuran arsip melebihi 128 MB.');
+    const bytes=await file.arrayBuffer();
+    if(id!==selection)return;
+    worker=new Worker(source);
+    worker.onmessage=({data})=>{
+      if(id!==selection)return;
+      worker.terminate();worker=null;
+      if(data.error){el('status').textContent=data.error;return;}
+      groups=data.groups;items=data.items;exact=new Map(items.map(item=>[item.code,item]));
+      const date=data.date.replace(/^(\d{4})(\d{2})(\d{2})$/,'$3-$2-$1');
+      el('status').textContent=[data.store,date,quantity.format(items.length)+' barang'].filter(Boolean).join(' · ');
+      el('plu').disabled=false;
+    };
+    worker.onerror=()=>{if(id===selection){worker.terminate();worker=null;el('status').textContent='Gagal membaca file. Coba buka halaman di Chrome dan pilih ulang backup.';}};
+    worker.postMessage(bytes,[bytes]);
+  }catch(error){if(id===selection)el('status').textContent=error.message;}
+};
+</script></body></html>
